@@ -3,8 +3,6 @@ package hashmap
 import (
 	"fmt"
 	"hash/fnv"
-	"sort"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"unsafe"
@@ -116,9 +114,9 @@ func TestKeysAndValues(t *testing.T) {
 	hm.put(16, 10)
 	hm.put(32, 100)
 	t.Logf("hm.length = %v", hm.length)
-	keys := hm.Keys()
+	keys := hm.keys()
 	t.Logf("keys = %v", keys)
-	values := hm.Values()
+	values := hm.values()
 	t.Logf("values = %v", values)
 }
 
@@ -132,21 +130,21 @@ func TestRemove(t *testing.T) {
 	hm.put(16, 10)
 	hm.put(32, 100)
 	t.Logf("hm.length = %v", hm.length)
-	keys := hm.Keys()
+	keys := hm.keys()
 	t.Logf("keys = %v", keys)
-	values := hm.Values()
+	values := hm.values()
 	t.Logf("values = %v", values)
-	hm.Remove(32)
+	hm.remove(32)
 	t.Logf("hm.length = %v", hm.length)
-	keys = hm.Keys()
+	keys = hm.keys()
 	t.Logf("keys = %v", keys)
-	values = hm.Values()
+	values = hm.values()
 	t.Logf("values = %v", values)
-	hm.Remove(0)
+	hm.remove(0)
 	t.Logf("hm.length = %v", hm.length)
-	keys = hm.Keys()
+	keys = hm.keys()
 	t.Logf("keys = %v", keys)
-	values = hm.Values()
+	values = hm.values()
 	t.Logf("values = %v", values)
 
 }
@@ -161,90 +159,105 @@ func TestResize(t *testing.T) {
 	hm.put(16, 10)
 	hm.put(32, 100)
 
-	t.Logf("hm.length = %v, hm.cap = %v", hm.length, hm.Cap())
-	keys := hm.Keys()
+	t.Logf("hm.length = %v, hm.cap = %v", hm.length, hm.cap)
+	keys := hm.keys()
 	t.Logf("keys = %v", keys)
-	values := hm.Values()
+	values := hm.values()
 	t.Logf("values = %v", values)
 
-	newBuckets := make([]unsafe.Pointer, 16*2)
-	copy(newBuckets, hm.buckets)
-	hm.buckets = newBuckets
-
-	t.Logf("hm.length = %v, hm.cap = %v", hm.length, hm.Cap())
-	keys = hm.Keys()
+	m := Map[int, int]{hashMap: hm, old: nil, resizing: uintptr(0)}
+	m.resize(32)
+	for m.resizing != uintptr(0) {
+		continue
+	}
+	t.Logf("hm.length = %v, hm.cap = %v", m.hashMap.length, m.Cap())
+	keys = m.hashMap.keys()
 	t.Logf("keys = %v", keys)
-	values = hm.Values()
+	values = m.hashMap.values()
 	t.Logf("values = %v", values)
 }
 
-func TestHashMap_C(t *testing.T) {
-
-	hm := NewHashMap[string, int](50000, func(key string) uint32 {
+func TestMapRsize(t *testing.T) {
+	hm := NewMap[string, int](16, func(key string) uint32 {
 		new32 := fnv.New32()
 		new32.Write([]byte(key))
 		return new32.Sum32()
 	}, 0)
 
-	wg := sync.WaitGroup{}
+	m := make(map[string]int, 16)
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 10000; j++ {
+			key := fmt.Sprintf("%v-[%v]", i+1, j)
+			//hm.Put(key, i)
+			m[key] = i
+		}
+		t.Logf("m.length = %v, m.cap = %v", len(m), len(m))
+		t.Logf("hm.length = %v, hm.cap = %v", hm.hashMap.length, hm.Cap())
+	}
 
-	//for i := 0; i < 5; i++ {
-	//	for j := 0; j < 1000; j++ {
-	//		key := fmt.Sprintf("%v-[%v]", i, j)
-	//		hm.put(key, j)
-	//	}
+}
+
+func TestHashMap_C(t *testing.T) {
+
+	hm := NewHashMap[string, int](1000000, func(key string) uint32 {
+		new32 := fnv.New32()
+		new32.Write([]byte(key))
+		return new32.Sum32()
+	}, 0)
+
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 10000; j++ {
+			key := fmt.Sprintf("%v-[%v]", i+1, j)
+			hm.put(key, i)
+		}
+		t.Logf("hm.length = %v, hm.cap = %v", hm.length, hm.cap)
+	}
+
+	//wg := sync.WaitGroup{}
+	//
+	//for i := 0; i < 10; i++ {
+	//	wg.Add(1)
+	//	go func(id int) {
+	//		for i := 0; i < 10000; i++ {
+	//			key := fmt.Sprintf("%v-[%v]", id+1, i)
+	//			hm.put(key, i)
+	//		}
+	//		wg.Done()
+	//	}(i)
 	//}
-
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			for i := 0; i < 10000; i++ {
-				key := fmt.Sprintf("%v-[%v]", id+1, i)
-				hm.put(key, i)
-			}
-			wg.Done()
-		}(i)
-	}
-	wg.Wait()
-	keys := hm.Keys()
-	sort.Strings(keys)
-	t.Logf("hm.length = %v, length = %v", hm.length, len(keys))
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			for i := 0; i < 10000; i++ {
-				key := fmt.Sprintf("%v-[%v]", id+1, i)
-				hash := hm.hashFunc(key)
-				idx := hash & hm.mask
-				_, ok := hm.Remove(key)
-				if !ok {
-					t.Logf("idx=%v, key=%v", idx, key)
-				}
-			}
-			wg.Done()
-		}(i)
-	}
-	wg.Wait()
+	//wg.Wait()
+	//keys := hm.keys()
+	//sort.Strings(keys)
+	//t.Logf("hm.length = %v, length = %v", hm.len(), len(keys))
+	//for i := 0; i < 10; i++ {
+	//	wg.Add(1)
+	//	go func(id int) {
+	//		for i := 0; i < 10000; i++ {
+	//			key := fmt.Sprintf("%v-[%v]", id+1, i)
+	//			hash := hm.hashFunc(key)
+	//			idx := hash & hm.mask
+	//			_, ok := hm.remove(key)
+	//			if !ok {
+	//				t.Logf("idx=%v, key=%v", idx, key)
+	//			}
+	//		}
+	//		wg.Done()
+	//	}(i)
+	//}
+	//wg.Wait()
 	//for i := 0; i < 5; i++ {
 	//	for j := 0; j < 10000; j++ {
 	//		key := fmt.Sprintf("%v-[%v]", i, j)
-	//		_, ok := hm.Remove(key)
+	//		_, ok := hm.remove(key)
 	//		if !ok {
 	//			fmt.Println(key)
 	//		}
 	//	}
 	//}
 
-	t.Log()
-	keys = hm.Keys()
-	sort.Strings(keys)
-	t.Logf("hm.length = %v, length = %v", hm.length, len(keys))
-	//for i := range keys {
-	//	hash := hm.hashFunc(keys[i])
-	//	idx := hash & hm.mask
-	//	b := (*bucket[string, int])(hm.buckets[idx])
-	//	_, target, _ := hm.search(keys[i], b)
-	//	t.Logf("idx=%v, entry=%v, key = %v, prev=%v", idx, target, keys[i], (*entry[string, int])(target.prev))
-	//
-	//}
+	//t.Log()
+	//keys = hm.keys()
+	//sort.Strings(keys)
+	//t.Logf("hm.length = %v, length = %v", hm.len(), len(keys))
+
 }

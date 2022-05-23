@@ -1,7 +1,6 @@
 package hashmap
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -27,7 +26,7 @@ type (
 		frozen   uintptr
 	}
 
-	hashMap[K comparable, V any] struct {
+	hMap[K comparable, V any] struct {
 		mu     sync.RWMutex
 		mask   uint32
 		cap    uint32
@@ -38,9 +37,13 @@ type (
 		loadFactor      float32
 		growThreshold   uint32
 		shrinkThreshold uint32
-		resizing        uintptr
-		old             unsafe.Pointer
 		hashFunc        HashFunc[K]
+	}
+
+	Map[K comparable, V any] struct {
+		resizing uintptr
+		hashMap  *hMap[K, V]
+		old      unsafe.Pointer
 	}
 )
 
@@ -66,6 +69,9 @@ func (b *bucket[K, V]) search(key K) (*entry[K, V], *entry[K, V], *entry[K, V]) 
 }
 
 func (b *bucket[K, V]) put(e *entry[K, V]) bool {
+	if b.frozen != uintptr(0) {
+		return false
+	}
 	for {
 		prev, target, next := b.search(e.key)
 
@@ -75,15 +81,11 @@ func (b *bucket[K, V]) put(e *entry[K, V]) bool {
 		}
 		e.prev = unsafe.Pointer(prev)
 		e.next = unsafe.Pointer(next)
-		if prev == nil {
-			if !atomic.CompareAndSwapPointer(&b.head, unsafe.Pointer(next), unsafe.Pointer(e)) {
-				continue
-			}
-		} else {
-			if !atomic.CompareAndSwapPointer(&prev.next, unsafe.Pointer(next), unsafe.Pointer(e)) {
-				continue
-			}
+
+		if !atomic.CompareAndSwapPointer(&b.head, unsafe.Pointer(next), unsafe.Pointer(e)) {
+			continue
 		}
+
 		if next != nil {
 			if !atomic.CompareAndSwapPointer(&next.prev, unsafe.Pointer(prev), unsafe.Pointer(e)) {
 				continue
@@ -94,7 +96,10 @@ func (b *bucket[K, V]) put(e *entry[K, V]) bool {
 	}
 }
 
-func (b *bucket[K, V]) delete(target *entry[K, V]) {
+func (b *bucket[K, V]) delete(target *entry[K, V]) bool {
+	if b.frozen != uintptr(0) {
+		return false
+	}
 	for {
 		if !atomic.CompareAndSwapUintptr(&b.deleting, uintptr(0), uintptr(1)) {
 			continue
@@ -117,34 +122,32 @@ func (b *bucket[K, V]) delete(target *entry[K, V]) {
 		}
 		atomic.StorePointer(&target.next, nil)
 		atomic.AddInt32(&b.length, -1)
-		return
+		return true
 	}
 }
 
-func NewHashMap[K comparable, V any](cap uint32, hashFunc HashFunc[K], loadFactor float32) *hashMap[K, V] {
+func NewHashMap[K comparable, V any](cap uint32, hashFunc HashFunc[K], loadFactor float32) *hMap[K, V] {
 	if loadFactor == 0 {
 		loadFactor = DefaultLoadFactor
 	}
-	m := new(hashMap[K, V])
-	m.mask = cap - uint32(1)
-	m.length = 0
-	m.cap = cap
-	m.buckets = make([]unsafe.Pointer, cap, cap)
-	for i := range m.buckets {
-		m.buckets[i] = unsafe.Pointer(&bucket[K, V]{
+	hm := new(hMap[K, V])
+	hm.mask = cap - uint32(1)
+	hm.length = 0
+	hm.cap = cap
+	hm.buckets = make([]unsafe.Pointer, cap, cap)
+	for i := range hm.buckets {
+		hm.buckets[i] = unsafe.Pointer(&bucket[K, V]{
 			0,
 			nil,
 			uintptr(0),
 			uintptr(0),
 		})
 	}
-	m.loadFactor = loadFactor
-	m.growThreshold = uint32(float32(cap) * loadFactor)
-	m.shrinkThreshold = uint32(float32(cap) * (1 - loadFactor))
-	m.resizing = uintptr(0)
-	m.hashFunc = hashFunc
-	m.old = nil
-	//return &hashMap[K, V]{
+	hm.loadFactor = loadFactor
+	hm.growThreshold = uint32(float32(cap) * loadFactor)
+	hm.shrinkThreshold = uint32(float32(cap) * (1 - loadFactor))
+	hm.hashFunc = hashFunc
+	//return &hMap[K, V]{
 	//	mask:            cap - uint32(1),
 	//	length:          0,
 	//	cap:             cap,
@@ -155,10 +158,10 @@ func NewHashMap[K comparable, V any](cap uint32, hashFunc HashFunc[K], loadFacto
 	//  rehashIndex: 	 -1,
 	//	hashFunc:        hashFunc,
 	//}
-	return m
+	return hm
 }
 
-func (hm *hashMap[K, V]) createEntry(key K, value V, hash uint32) *entry[K, V] {
+func (hm *hMap[K, V]) createEntry(key K, value V, hash uint32) *entry[K, V] {
 
 	e := &entry[K, V]{
 		key:   key,
@@ -170,7 +173,7 @@ func (hm *hashMap[K, V]) createEntry(key K, value V, hash uint32) *entry[K, V] {
 	return e
 }
 
-func (hm *hashMap[K, V]) put(key K, value V) bool {
+func (hm *hMap[K, V]) put(key K, value V) bool {
 	hash := hm.hashFunc(key)
 	idx := hash & hm.mask
 
@@ -184,7 +187,7 @@ func (hm *hashMap[K, V]) put(key K, value V) bool {
 	return false
 }
 
-func (hm *hashMap[K, V]) get(key K) (value V, ok bool) {
+func (hm *hMap[K, V]) get(key K) (value V, ok bool) {
 	if hm.length == 0 {
 		return value, false
 	}
@@ -200,7 +203,7 @@ func (hm *hashMap[K, V]) get(key K) (value V, ok bool) {
 	return value, false
 }
 
-func (hm *hashMap[K, V]) Remove(key K) (value V, ok bool) {
+func (hm *hMap[K, V]) remove(key K) (value V, ok bool) {
 
 	if hm.length == 0 {
 		return value, false
@@ -224,7 +227,7 @@ func (hm *hashMap[K, V]) Remove(key K) (value V, ok bool) {
 	return value, true
 }
 
-func (hm *hashMap[K, V]) Keys() []K {
+func (hm *hMap[K, V]) keys() []K {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 	keys := make([]K, 0, hm.length)
@@ -240,7 +243,7 @@ func (hm *hashMap[K, V]) Keys() []K {
 	return keys
 }
 
-func (hm *hashMap[K, V]) Values() []V {
+func (hm *hMap[K, V]) values() []V {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 	values := make([]V, 0, hm.length)
@@ -256,61 +259,105 @@ func (hm *hashMap[K, V]) Values() []V {
 	return values
 }
 
-func (hm *hashMap[K, V]) Len() int32 {
-	hm.mu.RLock()
-	defer hm.mu.RUnlock()
+func (hm *hMap[K, V]) len() int32 {
 	return hm.length
 }
 
-func (hm *hashMap[K, V]) Cap() uint32 {
-	hm.mu.RLock()
-	defer hm.mu.RUnlock()
-	return hm.cap
+func (hm *hMap[K, V]) readyGrow() bool {
+	if uint32(hm.length) > hm.growThreshold {
+		return true
+	}
+	return false
 }
 
-func (hm *hashMap[K, V]) resize(newCap uint32) {
+func (hm *hMap[K, V]) readyShrink() bool {
+	if uint32(hm.length) < hm.growThreshold {
+		return true
+	}
+	return false
+}
+
+func (m *Map[K, V]) Put(key K, value V) bool {
+	m.hashMap.put(key, value)
+	m.readResize()
+	return true
+}
+
+func (m *Map[K, V]) Get(key K) (value V, ok bool) {
+	value, ok = m.hashMap.get(key)
+	return
+}
+
+func (m *Map[K, V]) Remove(key K) (value V, ok bool) {
+	value, ok = m.hashMap.remove(key)
+	return
+}
+
+func (m *Map[K, V]) Keys() []K {
+	return m.hashMap.keys()
+}
+
+func (m *Map[K, V]) Values() []V {
+	return m.hashMap.values()
+}
+
+func (m *Map[K, V]) Len() int32 {
+	return m.hashMap.len()
+}
+
+func (m *Map[K, V]) Cap() uint32 {
+	return m.hashMap.cap
+}
+
+func (m *Map[K, V]) readResize() {
+	if m.hashMap.readyGrow() {
+		m.resize(m.hashMap.cap << 1)
+	} else if m.hashMap.readyShrink() {
+		m.resize(m.hashMap.cap >> 1)
+	}
+}
+
+func (m *Map[K, V]) resize(newCap uint32) {
 	// 策略：
 	// 1. 创建调整大小后新的buckets
 	// 2. 遍历并冻结旧的桶
 	// 3. 获取各个桶中的节点
 	// 4. rehash桶中的节点
 	// 5. 根据新的索引位置，插入新的桶中
-	atomic.CompareAndSwapUintptr(&hm.resizing, uintptr(0), uintptr(1))
-	defer atomic.StoreUintptr(&hm.resizing, uintptr(0))
+	atomic.CompareAndSwapUintptr(&m.resizing, uintptr(0), uintptr(1))
+	defer atomic.StoreUintptr(&m.resizing, uintptr(0))
 
-	newHashMap := NewHashMap[K, V](newCap, hm.hashFunc, hm.loadFactor)
-	newHashMap.old = unsafe.Pointer(hm)
-	old := hm
-	*hm = *newHashMap
+	newHashMap := NewHashMap[K, V](newCap, m.hashMap.hashFunc, m.hashMap.loadFactor)
+	m.old = unsafe.Pointer(m.hashMap)
 
-	for i := range old.buckets {
-		b := (*bucket[K, V])(old.buckets[i])
-		hm.rehash(b, i, old.cap)
+	for i := range m.hashMap.buckets {
+		b := (*bucket[K, V])(m.hashMap.buckets[i])
+		m.rehash(b, newHashMap, m.hashMap.cap)
+		m.hashMap.buckets[i] = nil
 	}
-
-	old = nil
-	atomic.StorePointer(&hm.old, nil)
-	runtime.GC()
+	m.hashMap = newHashMap
+	atomic.StorePointer(&m.old, nil)
 }
 
-func (hm *hashMap[K, V]) rehash(b *bucket[K, V], idx int, oldCap uint32) {
+func (m *Map[K, V]) rehash(b *bucket[K, V], newHashMap *hMap[K, V], oldCap uint32) {
 	atomic.CompareAndSwapUintptr(&b.frozen, uintptr(0), uintptr(1))
-	defer atomic.StoreUintptr(&b.frozen, uintptr(0))
 
-	p := (*entry[K, V])(b.head)
-	b1 := (*bucket[K, V])(hm.buckets[idx])
-	b2 := (*bucket[K, V])(hm.buckets[idx+int(oldCap)])
+	p := b.head
+
 	for p != nil {
-		if p.hash&oldCap == 0 {
-			//hm.put()
-			// 加到和原来位置相同的buckets
-			b1.put(p)
-		} else {
-			// 加到 旧位置 + oldCap处的buckets
-			b2.put(p)
-		}
+		cur := (*entry[K, V])(p)
+		p = cur.next
+		idx := cur.hash & newHashMap.mask
+		b1 := (*bucket[K, V])(newHashMap.buckets[idx])
+		b1.put(cur)
+		newHashMap.length++
 	}
-
 }
 
-//func (hm *hashMap[K, V]) shrink(b1, b2 *bucket[K, V]) {}
+func NewMap[K comparable, V any](cap uint32, hashFunc HashFunc[K], loadFactor float32) *Map[K, V] {
+	m := new(Map[K, V])
+	m.resizing = uintptr(0)
+	m.hashMap = NewHashMap[K, V](cap, hashFunc, loadFactor)
+	m.old = nil
+	return m
+}
