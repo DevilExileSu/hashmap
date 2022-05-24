@@ -1,1 +1,2 @@
-lock-free thread-safe resize hashmap
+# hashmap
+CAS实现的可以动态扩容HashMap
