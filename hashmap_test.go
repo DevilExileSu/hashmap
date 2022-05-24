@@ -192,10 +192,9 @@ func TestHMapConcurrencyPutAndRemove(t *testing.T) {
 	}
 	wg.Wait()
 
-	t.Log()
 	keys = hm.keys()
 	sort.Strings(keys)
-	t.Logf("hm.length = %v, length = %v", hm.length, len(keys))
+	t.Logf("hm.length = %v, length = %v,", hm.len(), len(keys))
 }
 
 func TestMapRsize(t *testing.T) {
@@ -205,14 +204,110 @@ func TestMapRsize(t *testing.T) {
 		return new32.Sum32()
 	}, 0)
 
+	for i := 0; i < 10; i++ {
+		for j := 0; j < 100; j++ {
+			key := fmt.Sprintf("%v-[%v]", i+1, j)
+			hm.Put(key, j)
+			//for hm.resizing != uintptr(0) {
+			//	continue
+			//}
+		}
+	}
+	keys := hm.Keys()
+	cnt := int32(0)
+	for i := range hm.getHashMap().buckets {
+		b := (*bucket[string, int])(hm.getHashMap().buckets[i])
+		cnt += b.length
+	}
+
+	t.Logf("hm.length = %v, length = %v, cap = %v, cnt = %v", hm.Len(), len(keys), hm.Cap(), cnt)
+}
+
+func TestMapPutAndRemove(t *testing.T) {
+	hm := NewMap[string, int](16, func(key string) uint32 {
+		new32 := fnv.New32()
+		new32.Write([]byte(key))
+		return new32.Sum32()
+	}, 0)
+
 	for i := 0; i < 100; i++ {
 		for j := 0; j < 10000; j++ {
 			key := fmt.Sprintf("%v-[%v]", i+1, j)
-			hm.Put(key, j)
-			for hm.resizing != uintptr(0) {
-				continue
-			}
+			hm.Put(key, i)
+			//for hm.resizing != uintptr(0) {
+			//	continue
+			//}
 		}
-		t.Logf("hm.length = %v, hm.cap = %v", hm.Len(), hm.Cap())
 	}
+
+	keys := hm.Keys()
+	sort.Strings(keys)
+	t.Logf("hm.length = %v, length = %v, cap = %v", hm.Len(), len(keys), hm.Cap())
+
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 10000; j++ {
+			key := fmt.Sprintf("%v-[%v]", i+1, j)
+			//for hm.resizing != uintptr(0) {
+			//	continue
+			//}
+			hm.Remove(key)
+			//if !ok {
+			//	t.Logf("idx=%v, key=%v", i, key)
+			//}
+		}
+	}
+
+	keys = hm.Keys()
+	sort.Strings(keys)
+	t.Logf("hm.length = %v, length = %v, cap=%v", hm.Len(), len(keys), hm.Cap())
+}
+
+func TestMapConcurrencyPutAndRemove(t *testing.T) {
+
+	hm := NewMap[string, int](16, func(key string) uint32 {
+		new32 := fnv.New32()
+		new32.Write([]byte(key))
+		return new32.Sum32()
+	}, 0)
+
+	wg := sync.WaitGroup{}
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			for i := 0; i < 10000; i++ {
+				key := fmt.Sprintf("%v-[%v]", id+1, i)
+				hm.Put(key, i)
+				//for hm.resizing != uintptr(0) {
+				//	continue
+				//}
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+
+	keys := hm.Keys()
+	sort.Strings(keys)
+	t.Logf("hm.length = %v, length = %v", hm.Len(), len(keys))
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			for i := 0; i < 10000; i++ {
+				key := fmt.Sprintf("%v-[%v]", id+1, i)
+				// 并发删除
+				_, ok := hm.Remove(key)
+				if !ok {
+					t.Logf("idx=%v, key=%v", id, key)
+				}
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	keys = hm.Keys()
+
+	sort.Strings(keys)
+	t.Logf("hm.length = %v, length = %v, cap=%v", hm.Len(), len(keys), hm.Cap())
 }
