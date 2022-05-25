@@ -281,11 +281,6 @@ func (m *Map[K, V]) Get(key K) (value V, ok bool) {
 }
 
 func (m *Map[K, V]) getBucket(key K) (int, *bucket[K, V], unsafe.Pointer) {
-	// 是否在进行resize
-	// 是否存在oldHashMap
-	// 找到oldHashMap中该数据对应的bucket
-	// 对该bucket进行rehash操作
-	// rehash结束后，找到newHashMap中该bucket，删除该数据
 	var flag int
 	if m.resizing == uintptr(1) {
 		flag = 3
@@ -298,14 +293,13 @@ func (m *Map[K, V]) getBucket(key K) (int, *bucket[K, V], unsafe.Pointer) {
 				m.rehash(b)
 				flag = 1
 			} else {
-				// 阻塞等待rehash结束
 				b.mu.Lock()
 				b.head = nil
 				b.mu.Unlock()
 			}
 		}
 	}
-	// 旧数据还没有完全rehash完毕，就在新的hashMap中删除数据
+
 	hm := m.getHashMap()
 	hash := hm.hashFunc(key)
 	idx := hash & hm.mask
@@ -313,9 +307,6 @@ func (m *Map[K, V]) getBucket(key K) (int, *bucket[K, V], unsafe.Pointer) {
 }
 
 func (m *Map[K, V]) Remove(key K) bool {
-	// 1. 获得key所在的bucket
-	// 2. 在bucket中找到要删除的节点
-	// 3. 调用bucket.delete()
 	m.mu.Lock()
 	for {
 		hashMap := m.getHashMap()
@@ -365,7 +356,6 @@ func (m *Map[K, V]) resize(oldHashMap *hMap[K, V]) {
 	atomic.StorePointer(&m.old, nil)
 }
 
-// rehash的同时删除
 func (m *Map[K, V]) rehash(b *bucket[K, V]) bool {
 	if !atomic.CompareAndSwapUintptr(&b.frozen, uintptr(0), uintptr(1)) {
 		return false
