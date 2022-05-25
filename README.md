@@ -1,2 +1,3 @@
 # hashmap
-CAS实现的可以动态扩容HashMap
+
+动态扩容HashMap，支持泛型

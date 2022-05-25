@@ -7,11 +7,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
 func (e *entry[K, V]) String() string {
-	return fmt.Sprintf("key: %v, value: %v, next: %v\n", e.key, e.value, e.next)
+	return fmt.Sprintf("key: %v, value: %v, hash: %v next: %v\n", e.key, e.value, e.hash, e.next)
 }
 
 func TestEntry(t *testing.T) {
@@ -50,11 +51,17 @@ func TestHMapPut(t *testing.T) {
 	hm := NewHashMap[int, int](16, func(key int) uint32 {
 		return uint32(key)
 	}, 0)
-	hm.put(0, 0)
-	hm.put(1, 1)
-	hm.put(2, 2)
-	hm.put(16, 10)
-	hm.put(32, 100)
+	entries := []*entry[int, int]{
+		hm.createEntry(0, 0),
+		hm.createEntry(1, 1),
+		hm.createEntry(2, 2),
+		hm.createEntry(16, 10),
+		hm.createEntry(32, 100),
+	}
+
+	for i := range entries {
+		hm.put(entries[i])
+	}
 
 	hash := hm.hashFunc(16)
 	idx := hash & hm.mask
@@ -68,10 +75,16 @@ func TestHMapPut(t *testing.T) {
 		i++
 		p = cur.next
 	}
-
-	hm.put(16, 16)
-	hm.put(32, 32)
-	hm.put(0, 1)
+	keys := hm.keys()
+	t.Logf("%v", keys)
+	entries2 := []*entry[int, int]{
+		hm.createEntry(0, 1),
+		hm.createEntry(16, 16),
+		hm.createEntry(32, 32),
+	}
+	for i := range entries2 {
+		hm.put(entries2[i])
+	}
 	b = (*bucket[int, int])(hm.buckets[idx])
 	p = b.head
 	i = 0
@@ -87,11 +100,18 @@ func TestHMapGet(t *testing.T) {
 	hm := NewHashMap[int, int](16, func(key int) uint32 {
 		return uint32(key)
 	}, 0)
-	hm.put(0, 0)
-	hm.put(1, 1)
-	hm.put(2, 2)
-	hm.put(16, 10)
-	hm.put(32, 100)
+
+	entries := []*entry[int, int]{
+		hm.createEntry(0, 0),
+		hm.createEntry(1, 1),
+		hm.createEntry(2, 2),
+		hm.createEntry(16, 10),
+		hm.createEntry(32, 100),
+	}
+
+	for i := range entries {
+		hm.put(entries[i])
+	}
 
 	if v, ok := hm.get(16); v != 10 || !ok {
 		t.Fatalf("err get, should: %v, but: %v", 10, v)
@@ -110,11 +130,18 @@ func TestHMapKeysAndValues(t *testing.T) {
 	hm := NewHashMap[int, int](16, func(key int) uint32 {
 		return uint32(key)
 	}, 0)
-	hm.put(0, 0)
-	hm.put(1, 1)
-	hm.put(2, 2)
-	hm.put(16, 10)
-	hm.put(32, 100)
+	entries := []*entry[int, int]{
+		hm.createEntry(0, 0),
+		hm.createEntry(1, 1),
+		hm.createEntry(2, 2),
+		hm.createEntry(16, 10),
+		hm.createEntry(32, 100),
+	}
+
+	for i := range entries {
+		hm.put(entries[i])
+	}
+
 	t.Logf("hm.length = %v", hm.length)
 	keys := hm.keys()
 	t.Logf("keys = %v", keys)
@@ -126,23 +153,29 @@ func TestHMapRemove(t *testing.T) {
 	hm := NewHashMap[int, int](16, func(key int) uint32 {
 		return uint32(key)
 	}, 0)
-	hm.put(0, 0)
-	hm.put(1, 1)
-	hm.put(2, 2)
-	hm.put(16, 10)
-	hm.put(32, 100)
+	entries := []*entry[int, int]{
+		hm.createEntry(0, 0),
+		hm.createEntry(1, 1),
+		hm.createEntry(2, 2),
+		hm.createEntry(16, 10),
+		hm.createEntry(32, 100),
+	}
+
+	for i := range entries {
+		hm.put(entries[i])
+	}
 	t.Logf("hm.length = %v", hm.length)
 	keys := hm.keys()
 	t.Logf("keys = %v", keys)
 	values := hm.values()
 	t.Logf("values = %v", values)
-	hm.remove(32)
-	t.Logf("hm.length = %v", hm.length)
-	keys = hm.keys()
-	t.Logf("keys = %v", keys)
-	values = hm.values()
-	t.Logf("values = %v", values)
-	hm.remove(0)
+	for _, key := range []int{0, 1, 32} {
+		hash := hm.hashFunc(key)
+		idx := hash & hm.mask
+		b := (*bucket[int, int])(hm.buckets[idx])
+		hm.remove(key, b)
+	}
+
 	t.Logf("hm.length = %v", hm.length)
 	keys = hm.keys()
 	t.Logf("keys = %v", keys)
@@ -150,23 +183,61 @@ func TestHMapRemove(t *testing.T) {
 	t.Logf("values = %v", values)
 
 }
+func TestHMapPutAndRemove(t *testing.T) {
 
+	hm := NewHashMap[string, int](1000000, func(key string) uint32 {
+		new32 := fnv.New32()
+		new32.Write([]byte(key))
+		return new32.Sum32()
+	}, 0)
+	//m := map[string]int{}
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 1000; j++ {
+			key := fmt.Sprintf("%v-[%v]", i+1, j)
+			hm.put(hm.createEntry(key, i))
+			//m[key] = j
+		}
+	}
+	keys := hm.keys()
+	sort.Strings(keys)
+
+	t.Logf("hm.length = %v, length = %v", hm.len(), len(keys))
+	for i := 0; i < 50; i++ {
+		for j := 0; j < 1000; j++ {
+			key := fmt.Sprintf("%v-[%v]", i+1, j)
+			hash := hm.hashFunc(key)
+			idx := hash & hm.mask
+			//delete(m, key)
+			b := (*bucket[string, int])(hm.buckets[idx])
+			_, ok := hm.remove(key, b)
+			if !ok {
+				t.Logf("idx=%v, key=%v", idx, key)
+			}
+		}
+
+	}
+
+	keys = hm.keys()
+	sort.Strings(keys)
+	t.Logf("hm.length = %v, length = %v,", hm.len(), len(keys))
+}
 func TestHMapConcurrencyPutAndRemove(t *testing.T) {
 
-	hm := NewHashMap[string, int](10000, func(key string) uint32 {
+	hm := NewHashMap[string, int](100000, func(key string) uint32 {
 		new32 := fnv.New32()
 		new32.Write([]byte(key))
 		return new32.Sum32()
 	}, 0)
 
 	wg := sync.WaitGroup{}
-
+	//m := sync.Map{}
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(id int) {
-			for i := 0; i < 10000; i++ {
+			for i := 0; i < 1000; i++ {
 				key := fmt.Sprintf("%v-[%v]", id+1, i)
-				hm.put(key, i)
+				hm.put(hm.createEntry(key, i))
+				//m.Store(key, i)
 			}
 			wg.Done()
 		}(i)
@@ -178,11 +249,12 @@ func TestHMapConcurrencyPutAndRemove(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(id int) {
-			for i := 0; i < 10000; i++ {
+			for i := 0; i < 1000; i++ {
 				key := fmt.Sprintf("%v-[%v]", id+1, i)
 				hash := hm.hashFunc(key)
 				idx := hash & hm.mask
-				_, ok := hm.remove(key)
+				b := (*bucket[string, int])(hm.buckets[idx])
+				_, ok := hm.remove(key, b)
 				if !ok {
 					t.Logf("idx=%v, key=%v", idx, key)
 				}
@@ -204,23 +276,20 @@ func TestMapRsize(t *testing.T) {
 		return new32.Sum32()
 	}, 0)
 
-	for i := 0; i < 10; i++ {
-		for j := 0; j < 100; j++ {
-			key := fmt.Sprintf("%v-[%v]", i+1, j)
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 10000; j++ {
+			key := fmt.Sprintf("%v-%v", i+1, j)
 			hm.Put(key, j)
-			//for hm.resizing != uintptr(0) {
-			//	continue
-			//}
 		}
 	}
-	keys := hm.Keys()
-	cnt := int32(0)
-	for i := range hm.getHashMap().buckets {
-		b := (*bucket[string, int])(hm.getHashMap().buckets[i])
-		cnt += b.length
+	for hm.resizing == uintptr(1) {
+		time.Sleep(1000)
+		continue
 	}
-
-	t.Logf("hm.length = %v, length = %v, cap = %v, cnt = %v", hm.Len(), len(keys), hm.Cap(), cnt)
+	hashMap := hm.getHashMap()
+	keys := hashMap.keys()
+	sort.Strings(keys)
+	t.Logf("hm.length = %v, length = %v, cap = %v,", hm.Len(), len(keys), hm.Cap())
 }
 
 func TestMapPutAndRemove(t *testing.T) {
@@ -234,12 +303,12 @@ func TestMapPutAndRemove(t *testing.T) {
 		for j := 0; j < 10000; j++ {
 			key := fmt.Sprintf("%v-[%v]", i+1, j)
 			hm.Put(key, i)
-			//for hm.resizing != uintptr(0) {
-			//	continue
-			//}
 		}
 	}
-
+	for hm.resizing == uintptr(1) {
+		time.Sleep(1000)
+		continue
+	}
 	keys := hm.Keys()
 	sort.Strings(keys)
 	t.Logf("hm.length = %v, length = %v, cap = %v", hm.Len(), len(keys), hm.Cap())
@@ -247,23 +316,23 @@ func TestMapPutAndRemove(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		for j := 0; j < 10000; j++ {
 			key := fmt.Sprintf("%v-[%v]", i+1, j)
-			//for hm.resizing != uintptr(0) {
-			//	continue
-			//}
-			hm.Remove(key)
-			//if !ok {
-			//	t.Logf("idx=%v, key=%v", i, key)
-			//}
+			ok := hm.Remove(key)
+			if !ok {
+				t.Logf("idx=%v, key=%v", i, key)
+			}
 		}
 	}
-
+	for hm.resizing == uintptr(1) {
+		time.Sleep(1000)
+		continue
+	}
 	keys = hm.Keys()
 	sort.Strings(keys)
 	t.Logf("hm.length = %v, length = %v, cap=%v", hm.Len(), len(keys), hm.Cap())
+	//t.Logf("%v", keys)
 }
 
 func TestMapConcurrencyPutAndRemove(t *testing.T) {
-
 	hm := NewMap[string, int](16, func(key string) uint32 {
 		new32 := fnv.New32()
 		new32.Write([]byte(key))
@@ -272,32 +341,31 @@ func TestMapConcurrencyPutAndRemove(t *testing.T) {
 
 	wg := sync.WaitGroup{}
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func(id int) {
 			for i := 0; i < 10000; i++ {
 				key := fmt.Sprintf("%v-[%v]", id+1, i)
 				hm.Put(key, i)
-				//for hm.resizing != uintptr(0) {
-				//	continue
-				//}
 			}
 			wg.Done()
 		}(i)
 	}
 	wg.Wait()
-
+	for hm.resizing == uintptr(1) {
+		time.Sleep(1000)
+		continue
+	}
 	keys := hm.Keys()
 	sort.Strings(keys)
-	t.Logf("hm.length = %v, length = %v", hm.Len(), len(keys))
-
-	for i := 0; i < 10; i++ {
+	t.Logf("hm.length = %v, length = %v, cap=%v", hm.Len(), len(keys), hm.Cap())
+	//t.Log(keys)
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func(id int) {
 			for i := 0; i < 10000; i++ {
 				key := fmt.Sprintf("%v-[%v]", id+1, i)
-				// 并发删除
-				_, ok := hm.Remove(key)
+				ok := hm.Remove(key)
 				if !ok {
 					t.Logf("idx=%v, key=%v", id, key)
 				}
@@ -307,7 +375,11 @@ func TestMapConcurrencyPutAndRemove(t *testing.T) {
 	}
 	wg.Wait()
 	keys = hm.Keys()
-
+	for hm.resizing == uintptr(1) {
+		time.Sleep(1000)
+		continue
+	}
 	sort.Strings(keys)
 	t.Logf("hm.length = %v, length = %v, cap=%v", hm.Len(), len(keys), hm.Cap())
+	//t.Logf("%v", keys)
 }
