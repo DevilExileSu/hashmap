@@ -1,7 +1,6 @@
 package hashmap
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -61,6 +60,11 @@ func (b *bucket[K, V]) search(key K) (prev, cur *entry[K, V]) {
 	return nil, nil
 }
 
+// Attempt to lock, if failed, return (false, false).
+// If the bucket is frozen, it means that resize has occurred, return (false, false)
+// to notify Map to obtain a new bucket for put operation.
+// (true, false): The operation succeeded but no new nodes were created
+// (true, true): The operation was successful and a node was created
 func (b *bucket[K, V]) put(e *entry[K, V], update bool) (bool, bool) {
 	if b.mu.TryLock() {
 		if b.frozen != uintptr(0) {
@@ -84,6 +88,12 @@ func (b *bucket[K, V]) put(e *entry[K, V], update bool) (bool, bool) {
 	return false, false
 }
 
+// Similar to put method
+// Attempt to lock, if failed, return (false, false).
+// If the bucket is frozen, it means that resize has occurred, return (false, false)
+// to notify Map to obtain a new bucket for put operation.
+// (true, false): The operation succeeded but no nodes were deleted
+// (true, true): The operation succeeds and the node is deleted
 func (b *bucket[K, V]) delete(key K) (bool, bool) {
 	if b.mu.TryLock() {
 		if b.frozen != uintptr(0) {
@@ -142,6 +152,10 @@ func (hm *hMap[K, V]) createEntry(key K, value V) *entry[K, V] {
 	return e
 }
 
+// Get the bucket where the entry is located according to the hash
+// If the operation is successful and a node is created，hm.length++
+// If the operation fails, the lock is not obtained,
+// or the hMap is not new at this time, return false.
 func (hm *hMap[K, V]) put(e *entry[K, V]) bool {
 	idx := e.hash & hm.mask
 	b := (*bucket[K, V])(atomic.LoadPointer(&hm.buckets[idx]))
@@ -155,6 +169,30 @@ func (hm *hMap[K, V]) put(e *entry[K, V]) bool {
 	return false
 }
 
+func (hm *hMap[K, V]) putWithoutUpdating(e *entry[K, V]) bool {
+	idx := e.hash & hm.mask
+	b := (*bucket[K, V])(atomic.LoadPointer(&hm.buckets[idx]))
+
+	if done, ok := b.put(e, false); done {
+		if ok {
+			atomic.AddInt32(&hm.length, 1)
+		}
+		return true
+	}
+	return false
+}
+
+func (hm *hMap[K, V]) getWithBucket(key K, b *bucket[K, V]) (value V, ok bool) {
+	if b.length == 0 {
+		return value, false
+	}
+	_, target := b.search(key)
+	if target != nil {
+		return target.value, true
+	}
+	return value, false
+}
+
 func (hm *hMap[K, V]) get(key K) (value V, ok bool) {
 	if hm.length == 0 {
 		return value, false
@@ -163,7 +201,7 @@ func (hm *hMap[K, V]) get(key K) (value V, ok bool) {
 	hash := hm.hashFunc(key)
 	idx := hash & hm.mask
 
-	b := (*bucket[K, V])(hm.buckets[idx])
+	b := (*bucket[K, V])(atomic.LoadPointer(&hm.buckets[idx]))
 	_, target := b.search(key)
 	if target != nil {
 		return target.value, true
@@ -173,10 +211,19 @@ func (hm *hMap[K, V]) get(key K) (value V, ok bool) {
 
 func (hm *hMap[K, V]) remove(key K, b *bucket[K, V]) (bool, bool) {
 	done, ok := b.delete(key)
-	if done && ok {
-		atomic.AddInt32(&hm.length, -1)
+	if done {
+		if ok {
+			atomic.AddInt32(&hm.length, -1)
+		}
 	}
 	return done, ok
+}
+
+func (hm *hMap[K, V]) getBucket(key K) *bucket[K, V] {
+	hash := hm.hashFunc(key)
+	idx := hash & hm.mask
+	return (*bucket[K, V])(atomic.LoadPointer(&hm.buckets[idx]))
+
 }
 
 func (hm *hMap[K, V]) keys() []K {
@@ -219,38 +266,39 @@ func (m *Map[K, V]) getOldMap() *hMap[K, V] {
 	return (*hMap[K, V])(atomic.LoadPointer(&m.old))
 }
 
-func (m *Map[K, V]) readyGrow() bool {
-	hashMap := m.getHashMap()
-	if uint32(hashMap.length) > hashMap.growThreshold && atomic.CompareAndSwapUintptr(&m.resizing, uintptr(0), uintptr(1)) {
+func (m *Map[K, V]) readyGrow(hm *hMap[K, V]) bool {
+	if uint32(hm.length) > hm.growThreshold && atomic.CompareAndSwapUintptr(&m.resizing, uintptr(0), uintptr(1)) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		newCap := m.Cap() << 1
-		newHashMap := NewHashMap[K, V](newCap, hashMap.hashFunc, hashMap.loadFactor)
-		if ok := atomic.CompareAndSwapPointer(&m.old, nil, unsafe.Pointer(hashMap)); !ok {
+		newCap := hm.cap << 1
+		newHashMap := NewHashMap[K, V](newCap, hm.hashFunc, hm.loadFactor)
+		if ok := atomic.CompareAndSwapPointer(&m.old, m.old, unsafe.Pointer(hm)); !ok {
 			return false
 		}
-		if ok := atomic.CompareAndSwapPointer(&m.hashMap, unsafe.Pointer(hashMap), unsafe.Pointer(newHashMap)); !ok {
+		if ok := atomic.CompareAndSwapPointer(&m.hashMap, unsafe.Pointer(hm), unsafe.Pointer(newHashMap)); !ok {
 			return false
 		}
-		go m.resize(hashMap)
+		go m.resize(hm)
 		return true
 	}
 	return false
 }
 
-func (m *Map[K, V]) readyShrink() bool {
-	hashMap := m.getHashMap()
-	shouldShrink := uint32(hashMap.length) < hashMap.shrinkThreshold && hashMap.cap > MinInitialSize
+func (m *Map[K, V]) readyShrink(hm *hMap[K, V]) bool {
+
+	shouldShrink := uint32(hm.length) < hm.shrinkThreshold && hm.cap > MinInitialSize
 	if shouldShrink && atomic.CompareAndSwapUintptr(&m.resizing, uintptr(0), uintptr(1)) {
-		newCap := m.Cap() >> 1
-		newHashMap := NewHashMap[K, V](newCap, hashMap.hashFunc, hashMap.loadFactor)
-		if ok := atomic.CompareAndSwapPointer(&m.old, nil, unsafe.Pointer(hashMap)); !ok {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		newCap := hm.cap >> 1
+		newHashMap := NewHashMap[K, V](newCap, hm.hashFunc, hm.loadFactor)
+		if ok := atomic.CompareAndSwapPointer(&m.old, m.old, unsafe.Pointer(hm)); !ok {
 			return false
 		}
-		if ok := atomic.CompareAndSwapPointer(&m.hashMap, unsafe.Pointer(hashMap), unsafe.Pointer(newHashMap)); !ok {
+		if ok := atomic.CompareAndSwapPointer(&m.hashMap, unsafe.Pointer(hm), unsafe.Pointer(newHashMap)); !ok {
 			return false
 		}
-		go m.resize(hashMap)
+		go m.resize(hm)
 		return true
 	}
 	return false
@@ -266,7 +314,7 @@ func (m *Map[K, V]) Put(key K, value V) bool {
 			continue
 		}
 		m.mu.Unlock()
-		m.readyGrow()
+		m.readyGrow(hm)
 		return true
 	}
 
@@ -274,51 +322,26 @@ func (m *Map[K, V]) Put(key K, value V) bool {
 
 func (m *Map[K, V]) Get(key K) (value V, ok bool) {
 	m.mu.RLock()
-	defer m.mu.Unlock()
-	hashMap := m.getHashMap()
-	value, ok = hashMap.get(key)
+	defer m.mu.RUnlock()
+	b, hm := m.getBucket(key)
+	value, ok = hm.getWithBucket(key, b)
 	return
 }
 
-func (m *Map[K, V]) getBucket(key K) (int, *bucket[K, V], unsafe.Pointer) {
-	var flag int
-	if m.resizing == uintptr(1) {
-		flag = 3
-		old := m.getOldMap()
-		if old != nil {
-			hash := old.hashFunc(key)
-			idx := hash & old.mask
-			b := (*bucket[K, V])(atomic.LoadPointer(&old.buckets[idx]))
-			if b.frozen == uintptr(0) {
-				m.rehash(b)
-				flag = 1
-			} else {
-				b.mu.Lock()
-				b.head = nil
-				b.mu.Unlock()
-			}
-		}
-	}
-
-	hm := m.getHashMap()
-	hash := hm.hashFunc(key)
-	idx := hash & hm.mask
-	return flag, (*bucket[K, V])(atomic.LoadPointer(&hm.buckets[idx])), m.old
-}
-
+// Remove
+// Find the bucket where the key is located in the old hMap.
+// If the bucket has not been rehashed, call rehash()
+// remove() in new new hMap
 func (m *Map[K, V]) Remove(key K) bool {
 	m.mu.Lock()
 	for {
-		hashMap := m.getHashMap()
-		i, b, p := m.getBucket(key)
-		done, ok := hashMap.remove(key, b)
+		b, hm := m.getBucket(key)
+		done, ok := hm.remove(key, b)
 		if done {
 			if ok {
 				m.mu.Unlock()
-				m.readyShrink()
+				m.readyShrink(hm)
 				return ok
-			} else {
-				fmt.Println(i, " ", b, " ", p)
 			}
 			m.mu.Unlock()
 			return ok
@@ -326,58 +349,121 @@ func (m *Map[K, V]) Remove(key K) bool {
 	}
 }
 
+// Promise to get the rehashed bucket with the latest hashmap
+func (m *Map[K, V]) getBucket(key K) (*bucket[K, V], *hMap[K, V]) {
+	if m.resizing == uintptr(1) {
+		old := m.getOldMap()
+		if old != nil {
+			b := old.getBucket(key)
+			// The old bucket has not been rehashed, call rehash()
+			if b.frozen == uintptr(0) {
+				m.rehash(b)
+			}
+			// Block waiting for rehash to end
+			if b.frozen != uintptr(2) {
+				b.mu.Lock()
+				b.head = nil
+				b.mu.Unlock()
+			}
+		}
+	}
+	hm := m.getHashMap()
+	return hm.getBucket(key), hm
+}
+
 func (m *Map[K, V]) Keys() []K {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for {
+		resizing := atomic.LoadUintptr(&m.resizing)
+		if resizing == uintptr(0) {
+			break
+		}
+	}
 	hashMap := m.getHashMap()
 	return hashMap.keys()
 }
 
 func (m *Map[K, V]) Values() []V {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for {
+		resizing := atomic.LoadUintptr(&m.resizing)
+		if resizing == uintptr(0) {
+			break
+		}
+	}
 	hashMap := m.getHashMap()
 	return hashMap.values()
 }
 
 func (m *Map[K, V]) Len() int32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for {
+		resizing := atomic.LoadUintptr(&m.resizing)
+		if resizing == uintptr(0) {
+			break
+		}
+	}
 	hashMap := m.getHashMap()
 	return hashMap.len()
 }
 
 func (m *Map[K, V]) Cap() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for {
+		resizing := atomic.LoadUintptr(&m.resizing)
+		if resizing == uintptr(0) {
+			break
+		}
+	}
 	hashMap := m.getHashMap()
 	return hashMap.cap
 }
 
+// Rehashing the nodes of each bucket of the old hMap
 func (m *Map[K, V]) resize(oldHashMap *hMap[K, V]) {
 	oldBuckets := oldHashMap.buckets
 	for i := range oldBuckets {
 		b := (*bucket[K, V])(atomic.LoadPointer(&oldBuckets[i]))
 		m.rehash(b)
 	}
-	atomic.StoreUintptr(&m.resizing, uintptr(0))
+	// After all nodes are rehashed, throw away the old hMap
 	atomic.StorePointer(&m.old, nil)
+	atomic.StoreUintptr(&m.resizing, uintptr(0))
 }
 
 func (m *Map[K, V]) rehash(b *bucket[K, V]) bool {
-	if !atomic.CompareAndSwapUintptr(&b.frozen, uintptr(0), uintptr(1)) {
-		return false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	p := b.head
-	entries := make([]*entry[K, V], 0, b.length)
-	for p != nil {
-		cur := (*entry[K, V])(p)
-		entries = append(entries, cur)
-		p = cur.next
-	}
-	hm := m.getHashMap()
-	for i := 0; i < len(entries); {
-		atomic.StorePointer(&entries[i].next, nil)
-		if done := hm.put(entries[i]); done {
-			i++
+	if b.mu.TryLock() {
+		// frozen = 1: bucket can not write or delete
+		if !atomic.CompareAndSwapUintptr(&b.frozen, uintptr(0), uintptr(1)) {
+			b.mu.Unlock()
+			return false
 		}
+		p := b.head
+		entries := make([]*entry[K, V], 0, b.length)
+		hm := m.getHashMap()
+		for p != nil {
+			cur := (*entry[K, V])(p)
+			entries = append(entries, cur)
+			p = cur.next
+		}
+
+		// new bucket may be executing write or delete.
+		for i := 0; i < len(entries); {
+			atomic.StorePointer(&entries[i].next, nil)
+			if done := hm.putWithoutUpdating(entries[i]); done {
+				i++
+			}
+		}
+		// frozen = 2: bucket rehash complete
+		atomic.StoreUintptr(&b.frozen, uintptr(2))
+		b.mu.Unlock()
+		return true
 	}
-	atomic.StoreUintptr(&b.frozen, uintptr(2))
-	return true
+	return false
 }
 
 func NewMap[K comparable, V any](cap uint32, hashFunc HashFunc[K], loadFactor float32) *Map[K, V] {
